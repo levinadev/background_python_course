@@ -1,0 +1,33 @@
+# Тот же проект с RabbitMQ в роли брокера
+#   docker compose -f compose.yaml -f compose.rabbitmq.yaml up -d --build
+# Redis остаётся хранилищем результатов и данных приложения.
+# Панель RabbitMQ на http://localhost:15672, логин и пароль из RABBITMQ_USER и RABBITMQ_PASSWORD
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-app}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-change-me}
+    ports:
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+
+  web: &on-rabbitmq
+    environment:
+      BROKER_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-change-me}@rabbitmq:5672//
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  worker: *on-rabbitmq
+  worker-heavy: *on-rabbitmq
+  worker-ai: *on-rabbitmq
+  beat: *on-rabbitmq
+  flower: *on-rabbitmq
+
+volumes:
+  rabbitmq-data:

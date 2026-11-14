@@ -1,0 +1,108 @@
+# Запуск всего проекта одной командой
+#   docker compose up --build -d
+# Значения ${...} берутся из файла .env рядом (образец в .env.example)
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    # AOF сохраняет очередь при перезапуске Redis.
+    # noeviction не даёт Redis выбросить служебные ключи Celery, когда кончается память
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  web:
+    build: .
+    command: gunicorn --bind 0.0.0.0:8000 --workers 2 background.web:app
+    ports:
+      - "8000:8000"
+    environment: &env
+      REDIS_URL: redis://redis:6379
+      CELERY_TIMEZONE: ${CELERY_TIMEZONE:-Europe/Moscow}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-0}
+      MAIL_FROM: ${MAIL_FROM:-noreply@example.com}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Быстрые задачи, письма, запросы во внешние сервисы
+  worker:
+    build: .
+    # Время, чтобы закончить текущие задачи при остановке. Должно быть больше самой долгой задачи очереди
+    stop_grace_period: 2m
+    command: celery -A background.celery_app worker -Q default -l info --concurrency 4
+    environment: *env
+    volumes:
+      - output:/app/output
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Долгие задачи в своей очереди, чтобы не задерживать быстрые
+  worker-heavy:
+    build: .
+    stop_grace_period: 12m  # больше time_limit задачи build_report
+    # --max-tasks-per-child перезапускает процесс-исполнитель, если код понемногу копит память
+    command: celery -A background.celery_app worker -Q heavy -l info --concurrency 2 --max-tasks-per-child 100
+    environment: *env
+    volumes:
+      - output:/app/output
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Запросы к нейросети в своей очереди. Один процесс, чтобы не упираться в лимит запросов сервиса.
+  # По умолчанию отвечает учебная модель, настоящая подключается через compose.ollama.yaml
+  worker-ai:
+    build: .
+    stop_grace_period: 3m  # больше time_limit задачи summarize_report
+    command: celery -A background.celery_app worker -Q ai -l info --concurrency 1
+    environment:
+      <<: *env
+      AI_BACKEND: fake
+      AI_FAIL_RATE: ${AI_FAIL_RATE:-0.3}
+    volumes:
+      - output:/app/output
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Планировщик. Всегда ровно один, два отправят каждую задачу дважды
+  beat:
+    build: .
+    command: celery -A background.celery_app beat -l info --schedule /tmp/celerybeat-schedule
+    environment: *env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Мониторинг задач на http://localhost:5555
+  flower:
+    build: .
+    command: celery -A background.celery_app flower --port=5555
+    ports:
+      - "127.0.0.1:5555:5555"  # только с этого компьютера, наружу Flower не открывают
+    environment:
+      <<: *env
+      FLOWER_BASIC_AUTH: admin:${FLOWER_PASSWORD:-change-me}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Тестовый почтовый сервер, письма видно на http://localhost:8025.
+  # На сервере его не запускают, а SMTP_HOST указывает на настоящий почтовый сервис
+  mailpit:
+    image: axllent/mailpit:v1.32
+    ports:
+      - "127.0.0.1:8025:8025"
+
+volumes:
+  redis-data:
+  output:
